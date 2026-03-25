@@ -106,7 +106,6 @@ int main(int argc, char* argv[]) {
     std::string const filename = argv[1];
     int const target_index = std::stoi(argv[2]);
 
-
     AVFormatContext* fmt = nullptr;
 
     if (avformat_open_input(&fmt, filename.c_str() , nullptr, nullptr) < 0) {
@@ -147,8 +146,8 @@ int main(int argc, char* argv[]) {
     gst_init(nullptr, nullptr);
 
     VCU_Decode decoder;
-    decoder.set_vcu_info( p->width, p->height, fps );
-    decoder.decode_frame(filename, target_index);
+    decoder.decode( filename, p->width, p->height, fps, target_index );
+
 
     avformat_close_input(&fmt);
 

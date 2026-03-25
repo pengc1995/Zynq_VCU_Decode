@@ -16,21 +16,21 @@ include_directories(${SYSROOT}/usr/include/glib-2.0)
 include_directories(${SYSROOT}/usr/lib/glib-2.0/include)
 
 # Add source files
-add_executable(vcu_decode_minimal
-    main.cpp
-    VCU_Decode.cpp
+#add_executable(vcu_decode_minimal
+#    main.cpp
+#    VCU_Decode.cpp
+#)
+
+add_executable(vcu_decode_test
+    vcu_decode_test.cpp
 )
 
 # Link GStreamer libraries from sysroot
-target_link_libraries(vcu_decode_minimal
+target_link_libraries(vcu_decode_test
     ${SYSROOT}/usr/lib/aarch64-linux-gnu/libgstreamer-1.0.so
     ${SYSROOT}/usr/lib/aarch64-linux-gnu/libgobject-2.0.so
     ${SYSROOT}/usr/lib/aarch64-linux-gnu/libglib-2.0.so
     ${SYSROOT}/usr/lib/aarch64-linux-gnu/libgstapp-1.0.so
-    ${SYSROOT}/usr/lib/aarch64-linux-gnu/libavcodec.so
-    ${SYSROOT}/usr/lib/aarch64-linux-gnu/libavformat.so
-    ${SYSROOT}/usr/lib/aarch64-linux-gnu/libavutil.so
-    ${SYSROOT}/usr/lib/aarch64-linux-gnu/libswscale.so
 )
 
 include_directories(

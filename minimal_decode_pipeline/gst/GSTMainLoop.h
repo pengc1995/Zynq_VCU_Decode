@@ -6,7 +6,7 @@
 #include <gst/gstpipeline.h>
 #include <gst/gstelement.h>
 #include "GSTObject.h"
-#include <Utils/Kron_Exception.h>
+// #include <Utils/Kron_Exception.h>
 #include <fmt/format.h>
 
 
@@ -38,10 +38,10 @@ make_main_loop(
         decltype(
             []( [[maybe_unused]] GMainContext * context, [[maybe_unused]] gboolean is_running )
             {
-                throw
-                    Kron::Kron_Exception{
-                        fmt::format(
-                            MSG2USR "GST error: failed creating main loop." ) };
+                throw "GST Error";
+                //     Kron::Kron_Exception{
+                //         fmt::format(
+                //             MSG2USR "GST error: failed creating main loop." ) };
 
             })>
 
