@@ -55,18 +55,18 @@ void VCU_Decode::decoder_init(
 
     m_loop_thread = std::thread( [this]() { g_main_loop_run( m_loop ); } );
 
-    // Bring pipeline to PAUSED so it is ready to roll immediately
+    // Bring pipeline to PAUSED so it is ready to start immediately
     gst_element_set_state( decoding_pipeline.get(), GST_STATE_PAUSED );
     gst_element_get_state( decoding_pipeline.get(), nullptr, nullptr, GST_CLOCK_TIME_NONE );
 
-    // Start prefetch thread
+    // Start prefetch thread — it will switch pipeline to PLAYING immediately
     m_prefetch_running = true;
     m_prefetch_thread  = std::thread( [this]() { prefetch_loop(); } );
 }
 
 void VCU_Decode::decoder_deinit()
 {
-    // Stop prefetch thread
+    // Stop prefetch thread — wake all waiting condition variables
     m_prefetch_running = false;
     m_seek_cv.notify_all();
     m_queue_cv.notify_all();
@@ -75,7 +75,7 @@ void VCU_Decode::decoder_deinit()
     if ( m_prefetch_thread.joinable() )
         m_prefetch_thread.join();
 
-    // Stop GLib loop
+    // Stop GLib main loop
     if ( m_loop ) {
         if ( g_main_loop_is_running( m_loop ) )
             g_main_loop_quit( m_loop );
@@ -89,35 +89,47 @@ void VCU_Decode::decoder_deinit()
 }
 
 // ---------------------------------------------------------------------------
-// decode_frame  (called by VCU_Playback_Controller)
+// decode_frame  (called by VCU_Playback_Controller::get_frame)
+// Returns the physical address of the YUV slot for use with convert_to_rgb()
 // ---------------------------------------------------------------------------
 
-void VCU_Decode::decode_frame(
-        unsigned int  const frame_index,
-        uint8_t*      const destination )
+uint64_t VCU_Decode::decode_frame(
+        unsigned int const frame_index )
 {
-    // Check if this frame is already at the front of the prefetch queue
+    uint64_t yuv_phys_addr = 0u;
+
     {
         std::unique_lock<std::mutex> lock( m_queue_mutex );
 
-        // If the requested frame is not the next sequential frame,
-        // or if the queue is empty, signal a seek to the prefetch thread.
+        // Determine if we need a seek:
+        // - queue is empty, OR
+        // - requested frame is behind the prefetch window, OR
+        // - requested frame is more than 60 frames ahead of last decoded
         bool const need_seek = m_decoded_queue.empty()
-                            or ( m_decoded_queue.front().frame_index != frame_index
-                                 and ( static_cast<int>(frame_index) < m_last_decoded_frame
-                                       or static_cast<int>(frame_index) > m_last_decoded_frame + 60 ) );
+            or ( static_cast<int>(frame_index) < m_last_decoded_frame - static_cast<int>(MAX_QUEUE_SIZE) )
+            or ( static_cast<int>(frame_index) > m_last_decoded_frame + 60 );
 
-        if ( need_seek ) {
-            // Request seek
+        if ( need_seek )
+        {
             {
                 std::lock_guard<std::mutex> seek_lock( m_seek_mutex );
                 m_seek_target    = static_cast<int>( frame_index );
                 m_seek_requested = true;
             }
             m_seek_cv.notify_one();
-
-            // Flush the queue
             m_decoded_queue.clear();
+        }
+        else
+        {
+            // Discard frames at the front that are before the requested frame.
+            // This handles jumps forward within the prefetch window (e.g. #3 → #10)
+            // without triggering a seek.
+            while ( !m_decoded_queue.empty()
+                and m_decoded_queue.front().frame_index < frame_index )
+            {
+                m_decoded_queue.pop_front();
+                m_queue_cv.notify_one();  // free slot for prefetch thread
+            }
         }
 
         // Wait until the requested frame appears at the front of the queue
@@ -128,18 +140,17 @@ void VCU_Decode::decode_frame(
         });
 
         if ( !m_prefetch_running )
-            return;
+            return 0u;
 
-        // Copy from the prefetched YUV slot into the caller's destination
-        Decoded_Frame const& df = m_decoded_queue.front();
-        unsigned int const frame_size = meta.width * meta.height * 3u / 2u;
-        memcpy( destination, df.yuv_address, frame_size );
-
+        // Take the physical address — caller uses this for convert_to_rgb()
+        yuv_phys_addr = m_decoded_queue.front().phys_addr;
         m_decoded_queue.pop_front();
     }
 
-    // Wake prefetch thread — there is now a free slot
+    // Wake prefetch thread — a slot is now free
     m_queue_cv.notify_one();
+
+    return yuv_phys_addr;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +159,7 @@ void VCU_Decode::decode_frame(
 
 void VCU_Decode::prefetch_loop()
 {
-    // Start pipeline
+    // Start pipeline — stays PLAYING until deinit
     gst_element_set_state( decoding_pipeline.get(), GST_STATE_PLAYING );
     m_pipeline_playing = true;
 
@@ -157,7 +168,7 @@ void VCU_Decode::prefetch_loop()
     while ( m_prefetch_running )
     {
         // ----------------------------------------------------------------
-        // Check for a pending seek request
+        // Check for a pending seek request from decode_frame()
         // ----------------------------------------------------------------
         {
             std::unique_lock<std::mutex> seek_lock( m_seek_mutex );
@@ -169,7 +180,7 @@ void VCU_Decode::prefetch_loop()
 
                 seek_to( next_frame );
 
-                // Clear any stale sample signals
+                // Clear any stale sample signals from before the seek
                 {
                     std::lock_guard<std::mutex> s( m_sample_mutex );
                     m_sample_ready = false;
@@ -179,7 +190,7 @@ void VCU_Decode::prefetch_loop()
         }
 
         // ----------------------------------------------------------------
-        // Wait if queue is full — no point decoding if consumer is slow
+        // Wait if queue is full — no point decoding ahead of the consumer
         // ----------------------------------------------------------------
         {
             std::unique_lock<std::mutex> lock( m_queue_mutex );
@@ -192,25 +203,26 @@ void VCU_Decode::prefetch_loop()
             if ( !m_prefetch_running )
                 break;
 
-            // Re-check seek after waking
+            // Re-check seek after waking — seek clears the queue so we
+            // must restart from the top of the loop
             if ( m_seek_requested.load() )
                 continue;
         }
 
         // ----------------------------------------------------------------
-        // Allocate next YUV slot from the caller-provided allocator.
-        // We reuse the yuv_buffer_controller via a function pointer / callback
-        // set by VCU_Playback_Controller (see below).
+        // Get next YUV slot from the allocator set by VCU_Playback_Controller.
+        // The prefetch thread is the sole owner of yuv_buffer_controller —
+        // get_frame() never calls get_the_next_address() directly anymore.
         // ----------------------------------------------------------------
         if ( !m_get_yuv_slot )
         {
-            // No slot allocator set yet — wait
+            // Allocator not set yet — wait briefly and retry
             std::this_thread::sleep_for( std::chrono::milliseconds(1) );
             continue;
         }
 
-        uint8_t* slot = m_get_yuv_slot();
-        if ( !slot )
+        YUV_Slot const slot = m_get_yuv_slot();
+        if ( !slot.virt_addr )
             continue;
 
         // ----------------------------------------------------------------
@@ -220,7 +232,7 @@ void VCU_Decode::prefetch_loop()
 
         if ( !ok )
         {
-            // EOS — signal queue waiters and stop prefetching until seek
+            // EOS — wait here until decode_frame() signals a seek
             std::unique_lock<std::mutex> seek_lock( m_seek_mutex );
             m_seek_cv.wait( seek_lock, [&]() {
                 return !m_prefetch_running or m_seek_requested.load();
@@ -229,23 +241,27 @@ void VCU_Decode::prefetch_loop()
         }
 
         // ----------------------------------------------------------------
-        // Push decoded frame onto the queue
+        // Push successfully decoded frame onto the queue
         // ----------------------------------------------------------------
         {
             std::lock_guard<std::mutex> lock( m_queue_mutex );
-            m_decoded_queue.push_back( { next_frame, slot } );
+            m_decoded_queue.push_back( {
+                next_frame,
+                slot.virt_addr,
+                slot.phys_addr
+            });
             m_last_decoded_frame = static_cast<int>( next_frame );
         }
         m_queue_cv.notify_all();
 
         ++next_frame;
 
-        // Wrap around
+        // Wrap around at end of file
         if ( static_cast<int>( next_frame ) >= meta.total_frames )
             next_frame = 0u;
     }
 
-    // Stop pipeline
+    // Stop pipeline on exit
     gst_element_set_state( decoding_pipeline.get(), GST_STATE_PAUSED );
     m_pipeline_playing = false;
 }
@@ -255,8 +271,8 @@ void VCU_Decode::prefetch_loop()
 // ---------------------------------------------------------------------------
 
 bool VCU_Decode::decode_next_frame_into_slot(
-        unsigned int frame_index,
-        uint8_t*     slot_address )
+        unsigned int    frame_index,
+        YUV_Slot const& slot )
 {
     GstClockTime const frame_period =
         gst_util_uint64_scale( 1, GST_SECOND * meta.fps_d, meta.fps_n );
@@ -266,7 +282,18 @@ bool VCU_Decode::decode_next_frame_into_slot(
         + ( frame_index % 5 == 0 ? 0 : frame_period / 2 );
 
     m_current_target_frame = frame_index;
-    m_current_slot         = slot_address;
+    m_current_slot         = slot.virt_addr;
+
+    // Set gop_multiple_skip for roll-forward jumps to a multiple of 5.
+    // This handles the duplicate pts issue when the pipeline rolls forward
+    // by more than 1 frame to reach a GOP boundary — same root cause as
+    // the seek case, but without a seek being issued.
+    if ( frame_index % 5 == 0
+    and  frame_index != 0
+    and  static_cast<int>(frame_index) > m_last_decoded_frame + 1 )
+    {
+        m_gop_multiple_skip = true;
+    }
 
     // Clear sample signal
     {
@@ -297,8 +324,8 @@ void VCU_Decode::seek_to( unsigned int const frame_index )
         gst_util_uint64_scale( frame_index, GST_SECOND * meta.fps_d, meta.fps_n )
         + ( frame_index % 5 == 0 ? 0 : frame_period / 2 );
 
-    m_gop_multiple_skip =
-        ( frame_index % 5 == 0 ) and ( frame_index != 0 );
+    // Set gop_multiple_skip for seeks landing on a GOP boundary
+    m_gop_multiple_skip = ( frame_index % 5 == 0 ) and ( frame_index != 0 );
 
     gst_element_seek(
         decoding_pipeline.get(),
@@ -341,7 +368,8 @@ GstFlowReturn VCU_Decode::on_new_sample(
 
     if ( pts >= self->m_current_target_pts )
     {
-        // GOP multiple skip logic (same as before)
+        // GOP multiple skip — discard one frame after seek or roll-forward
+        // jump to a multiple-of-5 frame index to avoid duplicate pts issue
         if ( self->m_gop_multiple_skip and self->m_current_target_frame != 0 )
         {
             self->m_gop_multiple_skip = false;
@@ -356,9 +384,7 @@ GstFlowReturn VCU_Decode::on_new_sample(
         }
 
         if ( self->m_current_slot )
-        {
             memcpy( self->m_current_slot, map.data, map.size );
-        }
 
         gst_buffer_unmap( buffer, &map );
 
@@ -398,11 +424,11 @@ gboolean VCU_Decode::on_bus_callback(
         GError* err   = nullptr;
         gchar*  debug = nullptr;
         gst_message_parse_error( msg, &err, &debug );
-        std::cerr << "GStreamer error: " << (err ? err->message : "unknown") << "\n";
+        std::cerr << "GStreamer error: " << ( err ? err->message : "unknown" ) << "\n";
         g_error_free( err );
         g_free( debug );
 
-        // Treat as EOS so prefetch_loop doesn't hang
+        // Treat error as EOS so prefetch_loop doesn't hang
         std::lock_guard<std::mutex> lock( self->m_sample_mutex );
         self->m_eos_reached = true;
         self->m_sample_cv.notify_one();
@@ -432,7 +458,7 @@ void VCU_Decode::on_pad_added(
 }
 
 // ---------------------------------------------------------------------------
-// Pipeline setup (unchanged from original)
+// Pipeline setup
 // ---------------------------------------------------------------------------
 
 void VCU_Decode::create_pipeline( Save_File_Format const format )
@@ -440,13 +466,13 @@ void VCU_Decode::create_pipeline( Save_File_Format const format )
     bool const is_h264 = ( Save_File_Format::h264 == format );
 
     decoding_pipeline = make_gst_pipeline( "decoding-pipeline" );
-    file_source       = make_gst_element( "filesrc",                          "file-src" );
-    demuxer           = make_gst_element( "qtdemux",                          "demuxer" );
-    parser            = make_gst_element( is_h264 ? "h264parse" : "h265parse","parser" );
-    caps_filter       = make_gst_element( "capsfilter",                       "caps-filter" );
-    decoder           = make_gst_element( is_h264 ? "omxh264dec":"omxh265dec","decoder" );
-    raw_caps_filter   = make_gst_element( "capsfilter",                       "raw-caps-filter" );
-    app_sink          = make_gst_element( "appsink",                          "app-sink" );
+    file_source       = make_gst_element( "filesrc",                           "file-src" );
+    demuxer           = make_gst_element( "qtdemux",                           "demuxer" );
+    parser            = make_gst_element( is_h264 ? "h264parse" : "h265parse", "parser" );
+    caps_filter       = make_gst_element( "capsfilter",                        "caps-filter" );
+    decoder           = make_gst_element( is_h264 ? "omxh264dec" : "omxh265dec", "decoder" );
+    raw_caps_filter   = make_gst_element( "capsfilter",                        "raw-caps-filter" );
+    app_sink          = make_gst_element( "appsink",                           "app-sink" );
 
     if ( !decoding_pipeline.get() ) throw Kron::Kron_Exception( MSG2USR "Unable to create pipeline." );
     if ( !decoder.get()           ) throw Kron::Kron_Exception( MSG2USR "Unable to create decoder element." );
@@ -508,7 +534,7 @@ void VCU_Decode::configure_app_sink()
         G_OBJECT( app_sink.get() ),
         "emit-signals", TRUE,
         "sync",         FALSE,
-        "drop",         FALSE,   // don't drop frames — prefetch thread controls the rate
+        "drop",         FALSE,   // don't drop — prefetch thread controls the pace
         "max-buffers",  1,
         nullptr );
 
@@ -516,7 +542,7 @@ void VCU_Decode::configure_app_sink()
 }
 
 // ---------------------------------------------------------------------------
-// get_video_info (unchanged)
+// get_video_info
 // ---------------------------------------------------------------------------
 
 VideoMetaData VCU_Decode::get_video_info( std::filesystem::path const& file )
@@ -542,10 +568,10 @@ VideoMetaData VCU_Decode::get_video_info( std::filesystem::path const& file )
     if ( v_streams )
     {
         GstDiscovererVideoInfo* v_info = (GstDiscovererVideoInfo*)v_streams->data;
-        meta.width   = gst_discoverer_video_info_get_width( v_info );
-        meta.height  = gst_discoverer_video_info_get_height( v_info );
-        meta.fps_n   = gst_discoverer_video_info_get_framerate_num( v_info );
-        meta.fps_d   = gst_discoverer_video_info_get_framerate_denom( v_info );
+        meta.width   = gst_discoverer_video_info_get_width  ( v_info );
+        meta.height  = gst_discoverer_video_info_get_height ( v_info );
+        meta.fps_n   = gst_discoverer_video_info_get_framerate_num   ( v_info );
+        meta.fps_d   = gst_discoverer_video_info_get_framerate_denom ( v_info );
 
         GstCaps* caps = gst_discoverer_stream_info_get_caps( (GstDiscovererStreamInfo*)v_info );
         std::string caps_str = gst_caps_to_string( caps );
@@ -555,7 +581,8 @@ VideoMetaData VCU_Decode::get_video_info( std::filesystem::path const& file )
 
         GstClockTime duration = gst_discoverer_info_get_duration( info );
         if ( duration != GST_CLOCK_TIME_NONE && meta.fps_d != 0 )
-            meta.total_frames = static_cast<int>( gst_util_uint64_scale( duration, meta.fps_n, meta.fps_d * GST_SECOND ) );
+            meta.total_frames = static_cast<int>(
+                gst_util_uint64_scale( duration, meta.fps_n, meta.fps_d * GST_SECOND ) );
     }
     else
     {
