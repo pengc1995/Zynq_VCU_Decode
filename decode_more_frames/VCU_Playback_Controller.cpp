@@ -44,35 +44,33 @@ Frame_Acquisition_Controller::last_rgb_frame_addr_t VCU_Playback_Controller::get
         return placeholder_frame_paddr;
     }
 
-    auto frame_index = playback_controller.get_next_frame_index( time_point );
+    auto const frame_index = playback_controller.get_next_frame_index( time_point );
+
+    // Same frame as last time — return cached RGB address directly
     if ( frame_index == last_loaded_index ) {
         return last_loaded_address;
     }
 
-    // decode_frame() returns the physical address of the YUV slot that was
-    // already decoded by the prefetch thread. No PAUSED/PLAYING per frame.
+    std::cout << "frame_index: " << frame_index << "\n";
+
+    // Get the YUV address from cache (blocking on cache miss / seek)
     auto const start1 = std::chrono::high_resolution_clock::now();
-    uint64_t const yuv_phys_addr = vcu_decode.decode_frame( frame_index );
+    uint64_t const yuv_address = vcu_decode.decode_frame( frame_index );
     auto const end1 = std::chrono::high_resolution_clock::now();
     auto const duration1 = std::chrono::duration_cast<std::chrono::microseconds>( end1 - start1 );
-    std::cout << "decode_frame took: " << duration1.count() << " us\n";
+    std::cout << "decode_frame took:  " << duration1.count() << " us\n";
 
-    if ( yuv_phys_addr == 0u ) {
-        // Pipeline shutting down
-        return last_loaded_address;
-    }
+    // Convert YUV -> RGB using FPGA block
+    uint64_t const rgb_address = rgb_buffer_controller.get_the_next_address();
 
     auto const start2 = std::chrono::high_resolution_clock::now();
-    pl_yuv2rgb.convert_to_rgb( yuv_phys_addr, next_address_to_play );
+    pl_yuv2rgb.convert_to_rgb( yuv_address, rgb_address );
     auto const end2 = std::chrono::high_resolution_clock::now();
     auto const duration2 = std::chrono::duration_cast<std::chrono::microseconds>( end2 - start2 );
-    std::cout << "convert_to_rgb took: " << duration2.count() << " us\n";
+    std::cout << "convert_to_rgb took: " << duration2.count() << " us\n\n";
 
-    last_loaded_address = next_address_to_play;
+    last_loaded_address = rgb_address;
     last_loaded_index   = frame_index;
-
-    // Only RGB buffer pointer is updated here — YUV buffer is managed by prefetch thread
-    next_address_to_play = rgb_buffer_controller.get_the_next_address();
 
     return last_loaded_address;
 }
@@ -95,7 +93,6 @@ void VCU_Playback_Controller::init(
         if ( not vcu_path.empty() ) {
             read_vcu_layout_from_filesystem();
             playback_controller.configure_media_size( vcu_format.max_number_of_frames );
-            vcu_decode.decoder_init( vcu_path );
             pl_yuv2rgb.configure_yuv2rgb( vcu_format );
 
             yuv_frame_buffer.init(
@@ -105,18 +102,8 @@ void VCU_Playback_Controller::init(
                     true,
                     true );
 
-            // RGB buffer pointer is managed by get_frame()
-            next_address_to_play = rgb_buffer_controller.get_the_next_address();
-
-            // Give the prefetch thread exclusive ownership of the YUV buffer.
-            // It will call get_the_next_address() on yuv_buffer_controller to
-            // advance the ring buffer, completely independently of get_frame().
-            vcu_decode.set_yuv_slot_allocator( [this]() -> VCU_Decode::YUV_Slot {
-                uint64_t const paddr = yuv_buffer_controller.get_the_next_address();
-                uint8_t* vaddr = reinterpret_cast<uint8_t*>(
-                    yuv_frame_buffer.get_virtual_address_from_physical_address( paddr ) );
-                return { vaddr, paddr };
-            });
+            // Pass yuv buffer ownership to vcu_decode for prefetch management
+            vcu_decode.decoder_init( vcu_path, yuv_frame_buffer, yuv_buffer_controller );
 
             is_error = false;
         }
@@ -164,7 +151,7 @@ void VCU_Playback_Controller::read_vcu_layout_from_filesystem()
 }
 
 void VCU_Playback_Controller::prepare_placeholder_frame(
-        std::string const & error_message)
+        std::string const & error_message )
 {
     placeholder_frame_paddr = rgb_buffer_controller.get_the_next_address();
     auto placeholder_vaddr = const_cast<unsigned int*>(
